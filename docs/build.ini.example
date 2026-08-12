@@ -1,0 +1,21 @@
+# ArenaMW standalone portable build manifest
+# Place this file as build.ini next to the Data Files directory.
+
+[Build]
+format=1
+name="ArenaMW"
+data-path="Data Files"
+language="Russian"
+complete=false
+
+[Content]
+content="Morrowind.esm"
+content="Tribunal.esm"
+content="Bloodmoon.esm"
+content="EncoreMP 0.93 Base.esp"
+# groundcover="Example Groundcover.esp"
+
+[Archives]
+archive="Morrowind.bsa"
+archive="Tribunal.bsa"
+archive="Bloodmoon.bsa"

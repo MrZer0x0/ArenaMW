@@ -1,0 +1,225 @@
+name: Build ArenaMW Windows
+
+on:
+  workflow_dispatch:
+    inputs:
+      clear_build_cache:
+        description: Rebuild all dependencies and sources
+        required: false
+        default: false
+        type: boolean
+  push:
+    branches: [main]
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: arenamw-windows-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows-x64:
+    runs-on: windows-2022
+    timeout-minutes: 120
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.cache/ccache
+      CCACHE_MAXSIZE: 2G
+      CCACHE_COMPRESS: 'true'
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      WINDOWS_CACHE_EPOCH: v2
+      WINDOWS_CACHE_RUN: ${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Restore dependency downloads
+        id: dependency-download-cache
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.clear_build_cache == false }}
+        continue-on-error: true
+        uses: actions/cache/restore@v5
+        with:
+          path: deps
+          key: ${{ env.WINDOWS_CACHE_EPOCH }}-windows-x64-deps-${{ hashFiles('CI/before_script.msvc.sh') }}-${{ env.WINDOWS_CACHE_RUN }}
+          restore-keys: |
+            ${{ env.WINDOWS_CACHE_EPOCH }}-windows-x64-deps-${{ hashFiles('CI/before_script.msvc.sh') }}-
+            ${{ env.WINDOWS_CACHE_EPOCH }}-windows-x64-deps-
+
+      - name: Restore extracted dependency SDKs
+        id: dependency-sdk-cache
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.clear_build_cache == false }}
+        continue-on-error: true
+        uses: actions/cache/restore@v5
+        with:
+          path: MSVC2022_64_Ninja/deps
+          key: ${{ env.WINDOWS_CACHE_EPOCH }}-windows-x64-sdk-${{ hashFiles('CI/before_script.msvc.sh') }}-${{ env.WINDOWS_CACHE_RUN }}
+          restore-keys: |
+            ${{ env.WINDOWS_CACHE_EPOCH }}-windows-x64-sdk-${{ hashFiles('CI/before_script.msvc.sh') }}-
+            ${{ env.WINDOWS_CACHE_EPOCH }}-windows-x64-sdk-
+
+      - name: Restore compiler cache
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.clear_build_cache == false }}
+        continue-on-error: true
+        uses: actions/cache/restore@v5
+        with:
+          path: .cache/ccache
+          key: ${{ env.WINDOWS_CACHE_EPOCH }}-windows-x64-ccache-${{ env.WINDOWS_CACHE_RUN }}
+          restore-keys: |
+            ${{ env.WINDOWS_CACHE_EPOCH }}-windows-x64-ccache-
+
+      - name: Restore incremental Ninja build tree
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.clear_build_cache == false }}
+        continue-on-error: true
+        uses: actions/cache/restore@v5
+        with:
+          path: |
+            MSVC2022_64_Ninja
+            !MSVC2022_64_Ninja/deps
+            !MSVC2022_64_Ninja/deps/**
+          key: ${{ env.WINDOWS_CACHE_EPOCH }}-windows-x64-ninja-${{ hashFiles('CMakeLists.txt', '**/CMakeLists.txt', 'cmake/**', 'CI/before_script.msvc.sh') }}-${{ env.WINDOWS_CACHE_RUN }}
+          restore-keys: |
+            ${{ env.WINDOWS_CACHE_EPOCH }}-windows-x64-ninja-${{ hashFiles('CMakeLists.txt', '**/CMakeLists.txt', 'cmake/**', 'CI/before_script.msvc.sh') }}-
+            ${{ env.WINDOWS_CACHE_EPOCH }}-windows-x64-ninja-
+
+      - name: Install build tools
+        shell: pwsh
+        run: |
+          choco install ccache ninja --yes --no-progress
+          ccache --set-config=max_size=$env:CCACHE_MAXSIZE
+          ccache --set-config=compression=true
+          ccache --zero-stats
+
+      - name: Restore source timestamps for Ninja
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.clear_build_cache == false }}
+        run: |
+          set -euo pipefail
+          cache_revision_file="MSVC2022_64_Ninja/.arenamw-cache-revision"
+          if [[ ! -d MSVC2022_64_Ninja ]]; then
+            exit 0
+          fi
+
+          if [[ -s "$cache_revision_file" ]]; then
+            cache_revision="$(tr -d '[:space:]' < "$cache_revision_file")"
+            if git cat-file -e "${cache_revision}^{commit}" 2>/dev/null; then
+              python CI/restore-git-mtime.py --touch-changed-since "$cache_revision"
+              exit 0
+            fi
+          fi
+
+          python CI/restore-git-mtime.py
+
+      - name: Configure dependencies and project
+        run: |
+          set -euxo pipefail
+          args=(-c Release -p x64 -v 2022 -N -C -V -i "$GITHUB_WORKSPACE/install")
+          if [[ "${{ inputs.clear_build_cache }}" != "true" ]]; then
+            args+=(-k)
+          fi
+          bash CI/before_script.msvc.sh "${args[@]}"
+
+      - name: Build and install
+        run: |
+          set -euxo pipefail
+          source MSVC2022_64_Ninja/activate_msvc.sh
+          # Keep compiling independent units after the first failure so one CI
+          # run reports several actionable compiler errors instead of only one.
+          cmake --build MSVC2022_64_Ninja --config Release --parallel 2 -- -k 20
+          cmake --install MSVC2022_64_Ninja --config Release
+          ccache --show-stats || true
+          printf '%s\n' "$GITHUB_SHA" > MSVC2022_64_Ninja/.arenamw-cache-revision
+
+      - name: Verify standalone package
+        shell: pwsh
+        run: |
+          $required = @(
+            'install\openmw.exe',
+            'install\openmw-launcher.exe',
+            'install\openmw-wizard.exe',
+            'install\openmw-iniimporter.exe',
+            'install\openmw.cfg',
+            'install\defaults.bin',
+            'install\gamecontrollerdb.txt',
+            'install\SDL2.dll',
+            'install\OpenAL32.dll',
+            'install\MyGUIEngine.dll',
+            'install\Qt5Core.dll',
+            'install\Qt5Gui.dll',
+            'install\Qt5Widgets.dll',
+            'install\platforms\qwindows.dll',
+            'install\resources\shaders\HDR.glsl',
+            'install\resources\shaders\bloom_composite.frag',
+            'install\resources\mygui\openmw_quickloot.layout',
+            'install\resources\mygui\openmw_dialogue_window.layout',
+            'install\resources\mygui\openmw_dialogue_window.skin.xml',
+            'install\resources\mygui\openmw_chargen_race.layout',
+            'install\resources\mygui\openmw_hud.layout',
+            'install\resources\mygui\openmw_font.xml',
+            'install\resources\mygui\Pelagiad.ttf',
+            'install\resources\mygui\Ayembedt.ttf',
+            'install\resources\mygui\RussoOne-Regular.ttf'
+          )
+          foreach ($file in $required) {
+            if (-not (Test-Path $file -PathType Leaf)) {
+              throw "Required file is missing: $file"
+            }
+          }
+          if ((Test-Path 'install\tes3mp.exe') -or (Test-Path 'install\tes3mp-server.exe')) {
+            throw 'A multiplayer executable leaked into the standalone package.'
+          }
+
+      - name: Create ZIP
+        shell: pwsh
+        run: |
+          $name = 'ArenaMW-0.47-Windows-x64-${{ github.ref_name }}'
+          Compress-Archive -Path 'install\*' -DestinationPath "$name.zip" -Force
+          
+      - name: Upload Windows build
+        uses: actions/upload-artifact@v4
+        with:
+          name: ArenaMW-0.47-Windows-x64-${{ github.ref_name }}
+          path: ArenaMW-0.47-Windows-x64-${{ github.ref_name }}.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+      - name: Save dependency downloads
+        if: ${{ success() && (inputs.clear_build_cache == true || steps.dependency-download-cache.outputs.cache-matched-key == '') }}
+        continue-on-error: true
+        uses: actions/cache/save@v5
+        with:
+          path: deps
+          key: ${{ env.WINDOWS_CACHE_EPOCH }}-windows-x64-deps-${{ hashFiles('CI/before_script.msvc.sh') }}-${{ env.WINDOWS_CACHE_RUN }}
+
+      - name: Save extracted dependency SDKs
+        if: ${{ success() && (inputs.clear_build_cache == true || steps.dependency-sdk-cache.outputs.cache-matched-key == '') }}
+        continue-on-error: true
+        uses: actions/cache/save@v5
+        with:
+          path: MSVC2022_64_Ninja/deps
+          key: ${{ env.WINDOWS_CACHE_EPOCH }}-windows-x64-sdk-${{ hashFiles('CI/before_script.msvc.sh') }}-${{ env.WINDOWS_CACHE_RUN }}
+
+      - name: Save compiler cache
+        if: ${{ success() }}
+        continue-on-error: true
+        uses: actions/cache/save@v5
+        with:
+          path: .cache/ccache
+          key: ${{ env.WINDOWS_CACHE_EPOCH }}-windows-x64-ccache-${{ env.WINDOWS_CACHE_RUN }}
+
+      - name: Save incremental Ninja build tree
+        if: ${{ success() }}
+        continue-on-error: true
+        uses: actions/cache/save@v5
+        with:
+          path: |
+            MSVC2022_64_Ninja
+            !MSVC2022_64_Ninja/deps
+            !MSVC2022_64_Ninja/deps/**
+          key: ${{ env.WINDOWS_CACHE_EPOCH }}-windows-x64-ninja-${{ hashFiles('CMakeLists.txt', '**/CMakeLists.txt', 'cmake/**', 'CI/before_script.msvc.sh') }}-${{ env.WINDOWS_CACHE_RUN }}
